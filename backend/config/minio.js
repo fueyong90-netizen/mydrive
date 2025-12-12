@@ -1,38 +1,37 @@
 // backend/config/minio.js
-const Minio = require('minio');
-const { MINIO } = require('./env');
+const Minio = require("minio");
 
-// Initialisation du client MinIO
+// Initialisation du client MinIO avec les variables d'environnement Render
 const minioClient = new Minio.Client({
-  endPoint: MINIO.ENDPOINT,
-  port: MINIO.PORT,
-  useSSL: false, // Assurez-vous que c'est bien 'false' si vous n'utilisez pas HTTPS
-  accessKey: MINIO.ACCESS_KEY,
-  secretKey: MINIO.SECRET_KEY,
+  endPoint: process.env.MINIO_ENDPOINT || "localhost",
+  port: parseInt(process.env.MINIO_PORT || "9000"),
+  useSSL: process.env.MINIO_USE_SSL === "true",
+  accessKey: process.env.MINIO_ACCESS_KEY || "minioadmin",
+  secretKey: process.env.MINIO_SECRET_KEY || "minioadmin",
 });
 
 // Vérifier la connexion et créer le bucket si nécessaire
 async function initializeMinio() {
+  const bucketName = process.env.MINIO_BUCKET || "mydrive";
+
   try {
-    const bucketExists = await minioClient.bucketExists(MINIO.BUCKET);
-    if (!bucketExists) {
-      console.log(`MinIO: Le bucket '${MINIO.BUCKET}' n'existe pas. Création...`);
-      await minioClient.makeBucket(MINIO.BUCKET, 'us-east-1');
-      console.log(`MinIO: Bucket '${MINIO.BUCKET}' créé avec succès.`);
+    const exists = await minioClient.bucketExists(bucketName);
+    if (!exists) {
+      console.log(`MinIO: Le bucket '${bucketName}' n'existe pas. Création...`);
+      await minioClient.makeBucket(bucketName, "us-east-1");
+      console.log(`✅ Bucket '${bucketName}' créé avec succès.`);
     } else {
-      console.log(`MinIO: Connexion établie. Le bucket '${MINIO.BUCKET}' existe.`);
+      console.log(`✅ Connexion MinIO réussie sur ${process.env.MINIO_ENDPOINT}:${process.env.MINIO_PORT}`);
     }
   } catch (err) {
-    // Ceci est l'endroit où l'erreur ECONNREFUSED se produit typiquement.
-    console.error(`\n❌ ERREUR FATALE - Connexion MinIO échouée sur ${MINIO.ENDPOINT}:${MINIO.PORT}!`);
+    console.error(`\n❌ ERREUR FATALE - Connexion MinIO échouée sur ${process.env.MINIO_ENDPOINT}:${process.env.MINIO_PORT}!`);
     console.error("Détails de l'erreur:", err.message || err);
-    console.error("\nVérifiez que le service MinIO est bien lancé et accessible à cette adresse.");
-    console.error("Si vous utilisez Docker Compose, assurez-vous d'exécuter 'docker-compose up -d minio'.");
-    // Ne pas quitter, mais logguer l'erreur, car le serveur principal écoute déjà (port 5000)
+    console.error("\nVérifiez que les variables MINIO_* sont bien configurées dans Render.");
   }
 }
 
-// Lancer l'initialisation asynchrone (non-bloquante)
+// Initialisation asynchrone
 initializeMinio();
 
 module.exports = minioClient;
+
