@@ -1,61 +1,79 @@
-// backend/routes/files.js
-
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const crypto = require('crypto');
 const authMiddleware = require('../middleware/authMiddleware');
-// const virusScanner = require('../middleware/virusScanner'); // ❌ DÉSACTIVÉ
-const minioClient = require('../config/minio');
-const { MINIO } = require('../config/env');
 const pool = require('../config/db');
 
 // Configuration Multer : stockage en mémoire
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 } // 100 MB max
+});
+
+// Import MinIO (optionnel)
+const minioConfig = require('../config/minio');
 
 /**
  * =========================================
- * 1️⃣ UPLOAD DE FICHIER (SANS scan antivirus)
+ * 1️⃣ UPLOAD DE FICHIER
  * =========================================
  */
 router.post('/upload', authMiddleware, upload.single('file'), async (req, res) => {
-  // ✅ Retiré virusScanner du middleware
-  
-  if (!req.file) return res.status(400).json({ message: "Aucun fichier envoyé" });
+  if (!req.file) {
+    return res.status(400).json({ message: "Aucun fichier envoyé" });
+  }
   
   const { title, description, content_type } = req.body;
-  
   const fileName = `${Date.now()}-${req.file.originalname}`;
   
-  minioClient.putObject(MINIO.BUCKET, fileName, req.file.buffer, async (err) => {
-    if (err) {
-      console.error("MinIO putObject error:", err);
-      return res.status(500).json({ message: "Erreur upload" });
-    }
-
-    try {
-      await pool.query(
-        "INSERT INTO files (user_id, name, size, key, mime_type, title, description, content_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        [
-          req.user.id, 
-          req.file.originalname, 
-          req.file.size, 
-          fileName,
-          req.file.mimetype,
-          title || req.file.originalname,
-          description || '',
-          content_type || 'FILE'
-        ]
-      );
-      res.json({ message: "Contenu uploadé avec succès" });
-    } catch (err) {
-      console.error("Erreur DB après upload:", err);
-      minioClient.removeObject(MINIO.BUCKET, fileName, (removeErr) => {
-        if (removeErr) console.error("Erreur cleanup MinIO:", removeErr);
+  try {
+    // Si MinIO est disponible, uploader le fichier
+    if (minioConfig.isEnabled() && minioConfig.client) {
+      await new Promise((resolve, reject) => {
+        minioConfig.client.putObject(
+          minioConfig.bucket, 
+          fileName, 
+          req.file.buffer, 
+          (err) => {
+            if (err) reject(err);
+            else resolve();
+          }
+        );
       });
-      res.status(500).json({ message: "Erreur enregistrement DB" });
+      
+      console.log('✅ Fichier uploadé sur MinIO:', fileName);
+    } else {
+      console.warn('⚠️  MinIO indisponible - Métadonnées enregistrées sans fichier physique');
     }
-  });
+    
+    // Enregistrer les métadonnées dans la DB
+    await pool.query(
+      "INSERT INTO files (user_id, name, size, key, mime_type, title, description, content_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+      [
+        req.user.id, 
+        req.file.originalname, 
+        req.file.size, 
+        fileName,
+        req.file.mimetype,
+        title || req.file.originalname,
+        description || '',
+        content_type || 'FILE'
+      ]
+    );
+    
+    res.json({ 
+      message: "Fichier uploadé avec succès",
+      warning: !minioConfig.isEnabled() ? "Stockage physique indisponible - Métadonnées uniquement" : undefined
+    });
+    
+  } catch (err) {
+    console.error("❌ Erreur upload:", err);
+    res.status(500).json({ 
+      message: "Erreur lors de l'upload",
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+  }
 });
 
 /**
@@ -83,14 +101,17 @@ router.get('/', authMiddleware, async (req, res) => {
     
     res.json(files);
   } catch (err) {
-    console.error("Erreur liste fichiers:", err);
-    res.status(500).json({ message: "Erreur serveur" });
+    console.error("❌ Erreur liste fichiers:", err);
+    res.status(500).json({ 
+      message: "Erreur serveur",
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
 });
 
 /**
  * =========================================
- * 3️⃣ TÉLÉCHARGEMENT D'UN FICHIER (Privé)
+ * 3️⃣ TÉLÉCHARGEMENT D'UN FICHIER
  * =========================================
  */
 router.get('/download/:id', authMiddleware, async (req, res) => {
@@ -100,13 +121,23 @@ router.get('/download/:id', authMiddleware, async (req, res) => {
       [req.params.id, req.user.id]
     );
 
-    if (result.rows.length === 0)
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Fichier introuvable" });
+    }
 
     const file = result.rows[0];
-    minioClient.getObject(MINIO.BUCKET, file.key, (err, stream) => {
+    
+    // Vérifier si MinIO est disponible
+    if (!minioConfig.isEnabled() || !minioConfig.client) {
+      return res.status(503).json({ 
+        message: "Stockage de fichiers indisponible",
+        hint: "Configurez MinIO ou un service de stockage cloud"
+      });
+    }
+
+    minioConfig.client.getObject(minioConfig.bucket, file.key, (err, stream) => {
       if (err) {
-        console.error("Erreur téléchargement MinIO:", err);
+        console.error("❌ Erreur téléchargement MinIO:", err);
         return res.status(500).json({ message: "Erreur téléchargement" });
       }
 
@@ -115,8 +146,11 @@ router.get('/download/:id', authMiddleware, async (req, res) => {
       stream.pipe(res);
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Erreur serveur" });
+    console.error("❌ Erreur:", err);
+    res.status(500).json({ 
+      message: "Erreur serveur",
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
 });
 
@@ -132,68 +166,36 @@ router.delete('/:id', authMiddleware, async (req, res) => {
       [req.params.id, req.user.id]
     );
 
-    if (result.rows.length === 0)
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Fichier introuvable" });
+    }
 
     const file = result.rows[0];
 
-    minioClient.removeObject(MINIO.BUCKET, file.key, async (err) => {
-      if (err) {
-        console.error("Erreur suppression MinIO:", err);
-        return res.status(500).json({ message: "Erreur suppression" });
-      }
+    // Supprimer de MinIO si disponible
+    if (minioConfig.isEnabled() && minioConfig.client) {
+      await new Promise((resolve, reject) => {
+        minioConfig.client.removeObject(minioConfig.bucket, file.key, (err) => {
+          if (err) {
+            console.warn("⚠️  Erreur suppression MinIO:", err.message);
+          }
+          resolve(); // Continue même si erreur MinIO
+        });
+      });
+    }
 
-      await pool.query("DELETE FROM files WHERE id = $1", [req.params.id]);
-      res.json({ message: "Fichier supprimé avec succès" });
-    });
+    // Supprimer de la DB
+    await pool.query("DELETE FROM files WHERE id = $1", [req.params.id]);
+    
+    res.json({ message: "Fichier supprimé avec succès" });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Erreur serveur" });
+    console.error("❌ Erreur:", err);
+    res.status(500).json({ 
+      message: "Erreur serveur",
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
-});
-
-/**
- * =========================================
- * 5️⃣ GÉNÉRER ET ACTIVER LE PARTAGE PUBLIC
- * =========================================
- */
-router.post('/share/:id', authMiddleware, async (req, res) => {
-    try {
-        const fileId = req.params.id;
-        const userId = req.user.id;
-        
-        const fileResult = await pool.query(
-            "SELECT public_key FROM files WHERE id = $1 AND user_id = $2",
-            [fileId, userId]
-        );
-
-        if (fileResult.rows.length === 0)
-            return res.status(404).json({ message: "Fichier introuvable ou non autorisé" });
-
-        let publicKey = fileResult.rows[0].public_key;
-        if (!publicKey) {
-            publicKey = crypto.randomBytes(8).toString('hex');
-        }
-
-        await pool.query(
-            "UPDATE files SET is_public = TRUE, public_key = $1 WHERE id = $2 AND user_id = $3",
-            [publicKey, fileId, userId]
-        );
-
-        res.json({ 
-            message: "Partage activé", 
-            publicKey: publicKey,
-            publicUrl: `/api/public/download/${publicKey}`
-        });
-        
-    } catch (err) {
-        if (err.code === '23505') { 
-             return res.status(409).json({ message: "Erreur de clé unique, veuillez réessayer" });
-        }
-        console.error("Erreur partage de fichier:", err);
-        res.status(500).json({ message: "Erreur serveur lors de l'activation du partage" });
-    }
 });
 
 module.exports = router;
